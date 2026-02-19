@@ -10,8 +10,6 @@ dotenv.config();
 // =========================
 // Load service account (ENV first, then file)
 // =========================
-// ✅ الأفضل على Render: حط JSON كامل داخل ENV باسم FIREBASE_SERVICE_ACCOUNT_JSON
-// ✅ أو استخدم ملف محلي serviceAccountKey.json (مناسب للتجارب المحلية فقط)
 let serviceAccount = null;
 
 if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
@@ -21,7 +19,8 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON");
   }
 } else {
-  const serviceAccountPathEnv = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
+  const serviceAccountPathEnv =
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
   const serviceAccountPath = path.resolve(process.cwd(), serviceAccountPathEnv);
 
   if (!fs.existsSync(serviceAccountPath)) {
@@ -45,12 +44,21 @@ admin.initializeApp({
 const db = admin.firestore();
 const expo = new Expo();
 
+function pickBestToken(doc) {
+  const d = doc || {};
+  if (typeof d.deviceToken === "string" && d.deviceToken.length > 20) return d.deviceToken;
+  if (typeof d.fcmToken === "string" && d.fcmToken.length > 20) return d.fcmToken;
+  if (d.tokenType === "fcm" && typeof d.token === "string" && d.token.length > 20) return d.token;
+  if (typeof d.expoToken === "string") return d.expoToken;
+  if (typeof d.token === "string") return d.token;
+  return null;
+}
+
 function isExpoToken(t) {
   return typeof t === "string" && t.startsWith("ExponentPushToken[");
 }
 
 const app = express();
-
 
 function toNumber(v) {
   const n = Number(v);
@@ -59,13 +67,11 @@ function toNumber(v) {
 
 // حساب قيمة المشتريات (بدون توصيل) من order أو من lines
 function computeItemsTotal(order) {
-  // إذا التطبيق صار يخزن itemsTotal مباشرة
   if (order && order.itemsTotal != null) return toNumber(order.itemsTotal);
 
   const lines = Array.isArray(order?.lines) ? order.lines : [];
   return lines.reduce((sum, l) => {
     const price = toNumber(l?.price);
-    // ندعم عدة أسماء للكمية (qty / weightKg / kg / quantity)
     const qty =
       l?.qty != null ? toNumber(l.qty) :
       l?.weightKg != null ? toNumber(l.weightKg) :
@@ -77,24 +83,27 @@ function computeItemsTotal(order) {
 }
 
 function computeDeliveryFee(order) {
-  // إذا التطبيق صار يخزن deliveryFee
   if (order && order.deliveryFee != null) return toNumber(order.deliveryFee);
-  // افتراضي حسب طلبك: 20 شيكل
   return 20;
 }
 
+/**
+ * ✅ مهم: لو order.total موجود لكنه بدون توصيل، نحسب نحن.
+ * - إذا order.total + order.deliveryFee موجودين: نستخدم total كما هو.
+ * - غير هيك: itemsTotal + deliveryFee
+ */
 function computeGrandTotal(order) {
-  // إذا التطبيق صار يخزن total مباشرة نستخدمه
-  if (order && order.total != null) return toNumber(order.total);
+  const delivery = computeDeliveryFee(order);
+
+  if (order && order.total != null && order.deliveryFee != null) {
+    return toNumber(order.total);
+  }
 
   const itemsTotal = computeItemsTotal(order);
-  const delivery = computeDeliveryFee(order);
   return itemsTotal + delivery;
 }
 
-
-
-// ✅ CORS (مهم لو بتجرب من متصفح أو Web)
+// ✅ CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -141,7 +150,6 @@ async function sendPush(tokens, title, body, data = {}) {
   // 2) FCM
   if (fcmTokens.length) {
     try {
-      // FCM data لازم تكون strings
       const dataStr = Object.fromEntries(
         Object.entries(data || {}).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)])
       );
@@ -150,7 +158,7 @@ async function sendPush(tokens, title, body, data = {}) {
         tokens: fcmTokens,
         notification: { title, body },
         data: dataStr,
-        android: { notification: { channelId: "orders" } },
+        android: { priority: "high", notification: { channelId: "default" } },
       });
     } catch (e) {
       console.error("FCM push send error:", e);
@@ -168,9 +176,7 @@ async function getTokensForNewOrder(orderDoc) {
 
   // 1) admins
   const adminsSnap = await db.collection("pushTokens").where("role", "==", "admin").get();
-  const adminTokens = adminsSnap.docs
-    .map((d) => d.data()?.token || d.data()?.expoToken || d.data()?.deviceToken)
-    .filter(Boolean);
+  const adminTokens = adminsSnap.docs.map((d) => pickBestToken(d.data())).filter(Boolean);
 
   // 2) owners for this store
   let ownerTokens = [];
@@ -180,17 +186,15 @@ async function getTokensForNewOrder(orderDoc) {
       .where("role", "==", "owner")
       .where("ownerStoreId", "==", storeId)
       .get();
-    ownerTokens = ownersSnap.docs
-        .map((d) => d.data()?.token || d.data()?.expoToken || d.data()?.deviceToken)
-        .filter(Boolean);
+    ownerTokens = ownersSnap.docs.map((d) => pickBestToken(d.data())).filter(Boolean);
   }
 
-  // 3) customer token (if exists)
+  // 3) customer token
   let customerTokens = [];
   if (customerUid) {
     const custDoc = await db.collection("pushTokens").doc(customerUid).get();
     if (custDoc.exists) {
-      const t = custDoc.data()?.token || custDoc.data()?.expoToken || custDoc.data()?.deviceToken;
+      const t = pickBestToken(custDoc.data());
       if (t) customerTokens = [t];
     }
   }
@@ -200,11 +204,13 @@ async function getTokensForNewOrder(orderDoc) {
 
 // =========================
 // POST /notify/new-order
-// body: { orderId }
+// body: { orderId, deliveryFee?, itemsTotal?, grandTotal? }
 // =========================
 app.post("/notify/new-order", async (req, res) => {
   try {
-    const { orderId } = req.body || {};
+    const { orderId, deliveryFee: deliveryFeeFromClient, itemsTotal: itemsTotalFromClient, grandTotal: grandTotalFromClient } =
+      req.body || {};
+
     if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
 
     const orderDoc = await db.collection("orders").doc(orderId).get();
@@ -216,18 +222,23 @@ app.post("/notify/new-order", async (req, res) => {
     const titleOwner = `🛒 طلب جديد #${orderId}`;
     const bodyOwner = `طلب جديد من: ${customer.fullName || "زبون"} - ${customer.phone || ""}`;
 
+    // ✅ استخدم قيم التطبيق إن وُجدت، وإلا احسب من Firestore
+    const itemsTotal = (itemsTotalFromClient != null) ? toNumber(itemsTotalFromClient) : computeItemsTotal(order);
+    const deliveryFee = (deliveryFeeFromClient != null) ? toNumber(deliveryFeeFromClient) : computeDeliveryFee(order);
+    const grandTotal =
+      (grandTotalFromClient != null) ? toNumber(grandTotalFromClient) : (itemsTotal + deliveryFee);
+
     const titleAdmin = `🛎️ طلب جديد #${orderId} (لوحة الإدارة)`;
-    const bodyAdmin = `محل: ${order?.storeId || "-"} | الإجمالي: ${computeGrandTotal(order).toFixed(2)}₪`;
+    const bodyAdmin = `محل: ${order?.storeId || "-"} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
 
     const titleCustomer = `✅ تم استلام طلبك #${orderId}`;
 
-// ✅ نص الإشعار للزبون: قيمة المشتريات + توصيل 20 + الإجمالي
-const itemsTotal = computeItemsTotal(order);
-const deliveryFee = computeDeliveryFee(order);
-const grandTotal = computeGrandTotal(order);
-
-const bodyCustomer = `قيمة المشتريات: ${itemsTotal.toFixed(2)}₪ + توصيل: ${deliveryFee.toFixed(2)}₪ = الإجمالي: ${grandTotal.toFixed(2)}₪` + 
-  ` | الحالة: ${order?.status || "جديد"}`;
+    // ✅ سطر واحد عشان يبان أكيد على أندرويد
+    const bodyCustomer =
+      `قيمة المشتريات: ${itemsTotal.toFixed(2)}₪ | ` +
+      `أجار التوصيل: ${deliveryFee.toFixed(2)}₪ | ` +
+      `الإجمالي: ${grandTotal.toFixed(2)}₪ | ` +
+      `الحالة: ${order?.status || "جديد"}`;
 
     await sendPush(ownerTokens, titleOwner, bodyOwner, { type: "new_order", orderId });
     await sendPush(adminTokens, titleAdmin, bodyAdmin, { type: "new_order", orderId });
@@ -235,11 +246,7 @@ const bodyCustomer = `قيمة المشتريات: ${itemsTotal.toFixed(2)}₪ +
 
     res.json({
       ok: true,
-      counts: {
-        admin: adminTokens.length,
-        owner: ownerTokens.length,
-        customer: customerTokens.length,
-      },
+      counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length },
     });
   } catch (e) {
     console.error(e);
@@ -249,7 +256,6 @@ const bodyCustomer = `قيمة المشتريات: ${itemsTotal.toFixed(2)}₪ +
 
 // =========================
 // POST /notify/status-change
-// body: { orderId, status } (أو newStatus للتوافق)
 // =========================
 app.post("/notify/status-change", async (req, res) => {
   try {
@@ -262,7 +268,6 @@ app.post("/notify/status-change", async (req, res) => {
     const orderDoc = await db.collection("orders").doc(orderId).get();
     if (!orderDoc.exists) return res.status(404).json({ ok: false, error: "order not found" });
 
-    // نجيب توكنات الجميع حسب نفس قواعد الطلب
     const { adminTokens, ownerTokens, customerTokens } = await getTokensForNewOrder(orderDoc);
 
     const title = "🔄 تحديث حالة الطلب";
