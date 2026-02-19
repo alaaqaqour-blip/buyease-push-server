@@ -114,6 +114,20 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
+// ✅ LOGGER عام لكل الطلبات (بعد json عشان يطبع body)
+app.use((req, _res, next) => {
+  const now = new Date().toISOString();
+  console.log(`[${now}] REQ ${req.method} ${req.url}`);
+  if (req.method !== "GET") {
+    try {
+      console.log("BODY:", req.body);
+    } catch {
+      // ignore
+    }
+  }
+  next();
+});
+
 // ✅ Health check
 app.get("/health", (_req, res) => {
   res.json({ ok: true, message: "Push server is running" });
@@ -208,8 +222,14 @@ async function getTokensForNewOrder(orderDoc) {
 // =========================
 app.post("/notify/new-order", async (req, res) => {
   try {
-    const { orderId, deliveryFee: deliveryFeeFromClient, itemsTotal: itemsTotalFromClient, grandTotal: grandTotalFromClient } =
-      req.body || {};
+    console.log("✅ HIT /notify/new-order");
+
+    const {
+      orderId,
+      deliveryFee: deliveryFeeFromClient,
+      itemsTotal: itemsTotalFromClient,
+      grandTotal: grandTotalFromClient,
+    } = req.body || {};
 
     if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
 
@@ -223,10 +243,14 @@ app.post("/notify/new-order", async (req, res) => {
     const bodyOwner = `طلب جديد من: ${customer.fullName || "زبون"} - ${customer.phone || ""}`;
 
     // ✅ استخدم قيم التطبيق إن وُجدت، وإلا احسب من Firestore
-    const itemsTotal = (itemsTotalFromClient != null) ? toNumber(itemsTotalFromClient) : computeItemsTotal(order);
-    const deliveryFee = (deliveryFeeFromClient != null) ? toNumber(deliveryFeeFromClient) : computeDeliveryFee(order);
+    const itemsTotal =
+      itemsTotalFromClient != null ? toNumber(itemsTotalFromClient) : computeItemsTotal(order);
+    const deliveryFee =
+      deliveryFeeFromClient != null ? toNumber(deliveryFeeFromClient) : computeDeliveryFee(order);
     const grandTotal =
-      (grandTotalFromClient != null) ? toNumber(grandTotalFromClient) : (itemsTotal + deliveryFee);
+      grandTotalFromClient != null ? toNumber(grandTotalFromClient) : itemsTotal + deliveryFee;
+
+    console.log("CALC new-order:", { orderId, itemsTotal, deliveryFee, grandTotal, status: order?.status });
 
     const titleAdmin = `🛎️ طلب جديد #${orderId} (لوحة الإدارة)`;
     const bodyAdmin = `محل: ${order?.storeId || "-"} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
@@ -240,13 +264,19 @@ app.post("/notify/new-order", async (req, res) => {
       `الإجمالي: ${grandTotal.toFixed(2)}₪ | ` +
       `الحالة: ${order?.status || "جديد"}`;
 
+    console.log("CUSTOMER body =", bodyCustomer);
+
     await sendPush(ownerTokens, titleOwner, bodyOwner, { type: "new_order", orderId });
     await sendPush(adminTokens, titleAdmin, bodyAdmin, { type: "new_order", orderId });
     await sendPush(customerTokens, titleCustomer, bodyCustomer, { type: "new_order", orderId });
 
     res.json({
       ok: true,
-      counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length },
+      counts: {
+        admin: adminTokens.length,
+        owner: ownerTokens.length,
+        customer: customerTokens.length,
+      },
     });
   } catch (e) {
     console.error(e);
@@ -259,6 +289,8 @@ app.post("/notify/new-order", async (req, res) => {
 // =========================
 app.post("/notify/status-change", async (req, res) => {
   try {
+    console.log("🟡 HIT /notify/status-change");
+
     const { orderId, status, newStatus } = req.body || {};
     const finalStatus = status || newStatus;
     if (!orderId || !finalStatus) {
@@ -273,10 +305,15 @@ app.post("/notify/status-change", async (req, res) => {
     const title = "🔄 تحديث حالة الطلب";
     const body = `رقم الطلب: ${orderId} | الحالة الجديدة: ${finalStatus}`;
 
+    console.log("STATUS body =", body);
+
     const all = [...adminTokens, ...ownerTokens, ...customerTokens];
     await sendPush(all, title, body, { type: "status_change", orderId, status: finalStatus });
 
-    res.json({ ok: true, counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length } });
+    res.json({
+      ok: true,
+      counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length },
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
