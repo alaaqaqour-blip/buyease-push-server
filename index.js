@@ -208,8 +208,15 @@ async function getTokensForNewOrder(orderDoc) {
 // =========================
 app.post("/notify/new-order", async (req, res) => {
   try {
-    const { orderId, deliveryFee: deliveryFeeFromClient, itemsTotal: itemsTotalFromClient, grandTotal: grandTotalFromClient } =
-      req.body || {};
+    // ✅ إثبات أن هذا المسار انضرب + شو وصل من التطبيق
+    console.log("✅ HIT /notify/new-order | body =", JSON.stringify(req.body || {}));
+
+    const {
+      orderId,
+      deliveryFee: deliveryFeeFromClient,
+      itemsTotal: itemsTotalFromClient,
+      grandTotal: grandTotalFromClient,
+    } = req.body || {};
 
     if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
 
@@ -218,15 +225,27 @@ app.post("/notify/new-order", async (req, res) => {
 
     const { adminTokens, ownerTokens, customerTokens, order } = await getTokensForNewOrder(orderDoc);
 
+    // ✅ إثبات عدد التوكنات
+    console.log("TOKENS counts:", {
+      admin: adminTokens.length,
+      owner: ownerTokens.length,
+      customer: customerTokens.length,
+    });
+
     const customer = order?.customer || {};
     const titleOwner = `🛒 طلب جديد #${orderId}`;
     const bodyOwner = `طلب جديد من: ${customer.fullName || "زبون"} - ${customer.phone || ""}`;
 
     // ✅ استخدم قيم التطبيق إن وُجدت، وإلا احسب من Firestore
-    const itemsTotal = (itemsTotalFromClient != null) ? toNumber(itemsTotalFromClient) : computeItemsTotal(order);
-    const deliveryFee = (deliveryFeeFromClient != null) ? toNumber(deliveryFeeFromClient) : computeDeliveryFee(order);
+    const itemsTotal =
+      itemsTotalFromClient != null ? toNumber(itemsTotalFromClient) : computeItemsTotal(order);
+    const deliveryFee =
+      deliveryFeeFromClient != null ? toNumber(deliveryFeeFromClient) : computeDeliveryFee(order);
     const grandTotal =
-      (grandTotalFromClient != null) ? toNumber(grandTotalFromClient) : (itemsTotal + deliveryFee);
+      grandTotalFromClient != null ? toNumber(grandTotalFromClient) : (itemsTotal + deliveryFee);
+
+    // ✅ إثبات القيم المحسوبة
+    console.log("CALC new-order:", { itemsTotal, deliveryFee, grandTotal });
 
     const titleAdmin = `🛎️ طلب جديد #${orderId} (لوحة الإدارة)`;
     const bodyAdmin = `محل: ${order?.storeId || "-"} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
@@ -239,6 +258,9 @@ app.post("/notify/new-order", async (req, res) => {
       `أجار التوصيل: ${deliveryFee.toFixed(2)}₪ | ` +
       `الإجمالي: ${grandTotal.toFixed(2)}₪ | ` +
       `الحالة: ${order?.status || "جديد"}`;
+
+    // ✅ إثبات نص إشعار الزبون
+    console.log("CUSTOMER body =", bodyCustomer);
 
     await sendPush(ownerTokens, titleOwner, bodyOwner, { type: "new_order", orderId });
     await sendPush(adminTokens, titleAdmin, bodyAdmin, { type: "new_order", orderId });
@@ -259,6 +281,9 @@ app.post("/notify/new-order", async (req, res) => {
 // =========================
 app.post("/notify/status-change", async (req, res) => {
   try {
+    // ✅ إثبات أن هذا المسار انضرب + شو وصل
+    console.log("🟡 HIT /notify/status-change | body =", JSON.stringify(req.body || {}));
+
     const { orderId, status, newStatus } = req.body || {};
     const finalStatus = status || newStatus;
     if (!orderId || !finalStatus) {
@@ -270,13 +295,26 @@ app.post("/notify/status-change", async (req, res) => {
 
     const { adminTokens, ownerTokens, customerTokens } = await getTokensForNewOrder(orderDoc);
 
+    // ✅ إثبات عدد التوكنات
+    console.log("TOKENS counts (status-change):", {
+      admin: adminTokens.length,
+      owner: ownerTokens.length,
+      customer: customerTokens.length,
+    });
+
     const title = "🔄 تحديث حالة الطلب";
     const body = `رقم الطلب: ${orderId} | الحالة الجديدة: ${finalStatus}`;
+
+    // ✅ إثبات نص الإشعار
+    console.log("STATUS body =", body);
 
     const all = [...adminTokens, ...ownerTokens, ...customerTokens];
     await sendPush(all, title, body, { type: "status_change", orderId, status: finalStatus });
 
-    res.json({ ok: true, counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length } });
+    res.json({
+      ok: true,
+      counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length },
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
