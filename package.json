@@ -10,10 +10,10 @@
     "node": ">=18"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "expo-server-sdk": "^3.9.0",
     "express": "^4.19.2",
     "firebase-admin": "^12.4.0",
-    "dotenv": "^16.4.5"
-    
+    "typesense": "^3.0.5"
   }
 }

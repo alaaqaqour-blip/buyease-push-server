@@ -103,6 +103,17 @@ function computeGrandTotal(order) {
   return itemsTotal + delivery;
 }
 
+function getStoreLabel(order) {
+  return order?.storeName || order?.storeTitle || order?.storeLabel || order?.storeId || "-";
+}
+
+function getLineNames(order) {
+  const lines = Array.isArray(order?.lines) ? order.lines : [];
+  const names = lines.map((l) => String(l?.name || "").trim()).filter(Boolean);
+  if (!names.length) return "-";
+  return names.slice(0, 4).join("، ") + (names.length > 4 ? "..." : "");
+}
+
 // ✅ CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -187,12 +198,11 @@ async function getTokensForNewOrder(orderDoc) {
   const order = orderDoc.data();
   const storeId = order?.storeId;
   const customerUid = order?.customerUid;
+  const driverUid = order?.driverUid;
 
-  // 1) admins
   const adminsSnap = await db.collection("pushTokens").where("role", "==", "admin").get();
   const adminTokens = adminsSnap.docs.map((d) => pickBestToken(d.data())).filter(Boolean);
 
-  // 2) owners for this store
   let ownerTokens = [];
   if (storeId) {
     const ownersSnap = await db
@@ -203,7 +213,18 @@ async function getTokensForNewOrder(orderDoc) {
     ownerTokens = ownersSnap.docs.map((d) => pickBestToken(d.data())).filter(Boolean);
   }
 
-  // 3) customer token
+  const driversSnap = await db.collection("pushTokens").where("role", "==", "driver").get();
+  const driverTokens = driversSnap.docs.map((d) => pickBestToken(d.data())).filter(Boolean);
+
+  let assignedDriverTokens = [];
+  if (driverUid) {
+    const driverDoc = await db.collection("pushTokens").doc(driverUid).get();
+    if (driverDoc.exists) {
+      const t = pickBestToken(driverDoc.data());
+      if (t) assignedDriverTokens = [t];
+    }
+  }
+
   let customerTokens = [];
   if (customerUid) {
     const custDoc = await db.collection("pushTokens").doc(customerUid).get();
@@ -213,7 +234,7 @@ async function getTokensForNewOrder(orderDoc) {
     }
   }
 
-  return { adminTokens, ownerTokens, customerTokens, order };
+  return { adminTokens, ownerTokens, driverTokens, assignedDriverTokens, customerTokens, order };
 }
 
 // =========================
@@ -236,11 +257,13 @@ app.post("/notify/new-order", async (req, res) => {
     const orderDoc = await db.collection("orders").doc(orderId).get();
     if (!orderDoc.exists) return res.status(404).json({ ok: false, error: "order not found" });
 
-    const { adminTokens, ownerTokens, customerTokens, order } = await getTokensForNewOrder(orderDoc);
+    const { adminTokens, ownerTokens, driverTokens, customerTokens, order } = await getTokensForNewOrder(orderDoc);
 
     const customer = order?.customer || {};
-    const titleOwner = `🛒 طلب جديد #${orderId}`;
-    const bodyOwner = `طلب جديد من: ${customer.fullName || "زبون"} - ${customer.phone || ""}`;
+    const storeLabel = getStoreLabel(order);
+    const lineNames = getLineNames(order);
+    const titleOwner = `🛒 طلب جديد ${order?.orderNo || "#" + orderId}`;
+    const bodyOwner = `الزبون: ${customer.fullName || "زبون"} | الهاتف: ${customer.phone || "-"} | الأصناف: ${lineNames}`;
 
     // ✅ استخدم قيم التطبيق إن وُجدت، وإلا احسب من Firestore
     const itemsTotal =
@@ -252,10 +275,13 @@ app.post("/notify/new-order", async (req, res) => {
 
     console.log("CALC new-order:", { orderId, itemsTotal, deliveryFee, grandTotal, status: order?.status });
 
-    const titleAdmin = `🛎️ طلب جديد #${orderId} (لوحة الإدارة)`;
-    const bodyAdmin = `محل: ${order?.storeId || "-"} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
+    const titleAdmin = `🛎️ طلب جديد ${order?.orderNo || "#" + orderId} (لوحة الإدارة)`;
+    const bodyAdmin = `المتجر: ${storeLabel} | الزبون: ${customer.fullName || "زبون"} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
 
-    const titleCustomer = `✅ تم استلام طلبك #${orderId}`;
+    const titleDriver = `🚚 طلب جديد متاح`;
+    const bodyDriver = `المتجر: ${storeLabel} | الإجمالي: ${grandTotal.toFixed(2)}₪`;
+
+    const titleCustomer = `✅ تم استلام طلبك ${order?.orderNo || "#" + orderId}`;
 
     // ✅ سطر واحد عشان يبان أكيد على أندرويد
     const bodyCustomer =
@@ -268,15 +294,12 @@ app.post("/notify/new-order", async (req, res) => {
 
     await sendPush(ownerTokens, titleOwner, bodyOwner, { type: "new_order", orderId });
     await sendPush(adminTokens, titleAdmin, bodyAdmin, { type: "new_order", orderId });
+    await sendPush(driverTokens, titleDriver, bodyDriver, { type: "new_order", orderId });
     await sendPush(customerTokens, titleCustomer, bodyCustomer, { type: "new_order", orderId });
 
     res.json({
       ok: true,
-      counts: {
-        admin: adminTokens.length,
-        owner: ownerTokens.length,
-        customer: customerTokens.length,
-      },
+      counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length },
     });
   } catch (e) {
     console.error(e);
@@ -300,15 +323,48 @@ app.post("/notify/status-change", async (req, res) => {
     const orderDoc = await db.collection("orders").doc(orderId).get();
     if (!orderDoc.exists) return res.status(404).json({ ok: false, error: "order not found" });
 
-    const { adminTokens, ownerTokens, customerTokens } = await getTokensForNewOrder(orderDoc);
+    const { adminTokens, ownerTokens, customerTokens, assignedDriverTokens, order } = await getTokensForNewOrder(orderDoc);
 
     const title = "🔄 تحديث حالة الطلب";
     const body = `رقم الطلب: ${orderId} | الحالة الجديدة: ${finalStatus}`;
 
-    console.log("STATUS body =", body);
+    const all = [...adminTokens, ...ownerTokens, ...customerTokens, ...assignedDriverTokens];
+    await sendPush(all, title, body, { type: "status_change", orderId, status: finalStatus });
+
+    res.json({ ok: true, counts: { admin: adminTokens.length, owner: ownerTokens.length, customer: customerTokens.length, driver: assignedDriverTokens.length } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+app.post("/notify/driver-accepted", async (req, res) => {
+  try {
+    const { orderId, driverUid } = req.body || {};
+    if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
+
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) return res.status(404).json({ ok: false, error: "order not found" });
+
+    const { adminTokens, ownerTokens, customerTokens, order } = await getTokensForNewOrder(orderDoc);
+
+    let driverName = "السائق";
+    if (driverUid) {
+      try {
+        const driverUserDoc = await db.collection("users").doc(driverUid).get();
+        if (driverUserDoc.exists) {
+          const d = driverUserDoc.data() || {};
+          driverName = d.displayName || d.fullName || d.name || driverName;
+        }
+      } catch {}
+    }
+
+    const title = "🚚 تم استلام الطلب من السائق";
+    const body = `الطلب: ${order?.orderNo || "#" + orderId} | السائق: ${driverName}`;
 
     const all = [...adminTokens, ...ownerTokens, ...customerTokens];
-    await sendPush(all, title, body, { type: "status_change", orderId, status: finalStatus });
+    await sendPush(all, title, body, { type: "driver_accepted", orderId, driverUid: driverUid || "" });
 
     res.json({
       ok: true,
@@ -319,6 +375,7 @@ app.post("/notify/status-change", async (req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 const port = Number(process.env.PORT || 3000);
 app.listen(port, "0.0.0.0", () => console.log("Push server running on port", port));
